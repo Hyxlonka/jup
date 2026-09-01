@@ -1,0 +1,668 @@
+// ==UserScript==
+// @name         Easy-PLU AutoFill (v14.7.2 Test-Save Fix)
+// @namespace    http://tampermonkey.net/
+// @version      14.7.2
+// @description  Automatisches Speichern manueller Eingaben auch im Test-Modus.
+// @author       User
+// @match        https://*.knowledge-hero.com/*
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let autoRunInterval = null;
+    let autoTestInterval = null;
+
+    function hohleDaten(key) {
+        try {
+            const d = localStorage.getItem(key);
+            return d ? JSON.parse(d) : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function speichereDaten(key, val) {
+        try {
+            localStorage.setItem(key, JSON.stringify(val));
+        } catch (e) {
+            console.error('Fehler beim Speichern:', e);
+        }
+    }
+
+    function sammleAlleTextKnoten(root = document.body) {
+        let knoten = [];
+        let elemente = Array.from(root.querySelectorAll('*'));
+
+        for (let el of elemente) {
+            const tag = el.tagName.toLowerCase();
+            if (['script', 'style', 'footer', 'header', 'svg', 'button', 'input', 'nav'].includes(tag)) continue;
+
+            if (tag === 'img') {
+                const alt = el.getAttribute('alt');
+                const title = el.getAttribute('title');
+                const src = el.getAttribute('src');
+
+                if (alt) knoten.push({ el: el, text: alt.trim(), type: 'alt' });
+                if (title) knoten.push({ el: el, type: 'title', text: title.trim() });
+                if (src && src.includes('/')) {
+                    const datei = src.split('/').pop().split('.')[0].replace(/[-_]/g, ' ');
+                    knoten.push({ el: el, text: datei.trim(), type: 'src' });
+                }
+            }
+
+            if (el.children.length === 0) {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (txt.length > 0) {
+                    knoten.push({ el: el, text: txt, type: 'text' });
+                }
+            }
+
+            if (el.shadowRoot) {
+                knoten = knoten.concat(sammleAlleTextKnoten(el.shadowRoot));
+            }
+        }
+        return knoten;
+    }
+
+    function zeigeStatus(msg) {
+        let statusEl = document.getElementById('plu-status-msg');
+        if (!statusEl) {
+            statusEl = document.createElement('div');
+            statusEl.id = 'plu-status-msg';
+            statusEl.style.marginBottom = '6px';
+            statusEl.style.background = 'rgba(25, 25, 25, 0.9)';
+            statusEl.style.color = '#e0e0e0';
+            statusEl.style.padding = '5px 10px';
+            statusEl.style.borderRadius = '6px';
+            statusEl.style.fontSize = '11px';
+            statusEl.style.textAlign = 'right';
+            statusEl.style.backdropFilter = 'blur(4px)';
+            statusEl.style.border = '1px solid rgba(255,255,255,0.08)';
+            statusEl.style.boxShadow = '0px 2px 6px rgba(0,0,0,0.2)';
+
+            const container = document.getElementById('plu-menu-container');
+            if (container) {
+                container.insertBefore(statusEl, container.firstChild);
+            }
+        }
+        if (statusEl) statusEl.innerText = msg;
+    }
+
+    function oeffneSpeicherModal() {
+        let modal = document.getElementById('plu-storage-modal');
+        if (modal) modal.remove();
+
+        modal = document.createElement('div');
+        modal.id = 'plu-storage-modal';
+        modal.style.position = 'fixed';
+        modal.style.top = '50%';
+        modal.style.left = '50%';
+        modal.style.transform = 'translate(-50%, -50%)';
+        modal.style.width = '450px';
+        modal.style.maxHeight = '80vh';
+        modal.style.background = '#1a1a1a';
+        modal.style.color = '#e0e0e0';
+        modal.style.zIndex = '10000000';
+        modal.style.borderRadius = '10px';
+        modal.style.border = '1px solid rgba(255,255,255,0.1)';
+        modal.style.boxShadow = '0px 10px 30px rgba(0,0,0,0.6)';
+        modal.style.display = 'flex';
+        modal.style.flexDirection = 'column';
+        modal.style.overflow = 'hidden';
+        modal.style.fontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+        const header = document.createElement('div');
+        header.style.padding = '12px 16px';
+        header.style.background = '#242424';
+        header.style.display = 'flex';
+        header.style.justifyContent = 'space-between';
+        header.style.alignItems = 'center';
+        header.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
+        header.innerHTML = '<strong style="font-size: 14px; color: #fff;">📦 Gespeicherte PLU-Artikel</strong>';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.innerText = '✕';
+        closeBtn.style.background = 'transparent';
+        closeBtn.style.border = 'none';
+        closeBtn.style.color = '#aaa';
+        closeBtn.style.fontSize = '14px';
+        closeBtn.style.cursor = 'pointer';
+        closeBtn.addEventListener('click', () => modal.remove());
+        header.appendChild(closeBtn);
+        modal.appendChild(header);
+
+        const content = document.createElement('div');
+        content.style.padding = '12px';
+        content.style.overflowY = 'auto';
+        content.style.flex = '1';
+
+        const gespeichertePlus = hohleDaten('mein_plu_speicher') || {};
+        const keys = Object.keys(gespeichertePlus);
+
+        if (keys.length === 0) {
+            content.innerHTML = '<p style="color: #777; text-align: center; font-size: 12px; margin: 20px 0;">Noch keine Artikel im Speicher hinterlegt.</p>';
+        } else {
+            const table = document.createElement('table');
+            table.style.width = '100%';
+            table.style.borderCollapse = 'collapse';
+            table.innerHTML = `<thead><tr style="border-bottom: 1px solid #333; text-align: left; font-size: 11px; color: #888;"><th style="padding: 6px;">Artikelname</th><th style="padding: 6px;">PLU</th><th style="padding: 6px; text-align: right;">Aktion</th></tr></thead>`;
+
+            const tbody = document.createElement('tbody');
+
+            for (let name of keys) {
+                let plu = gespeichertePlus[name];
+                let tr = document.createElement('tr');
+                tr.style.borderBottom = '1px solid #222';
+                tr.style.fontSize = '12px';
+
+                tr.innerHTML = `
+                    <td style="padding: 6px; word-break: break-word; color: #ddd;">${name}</td>
+                    <td style="padding: 6px; font-weight: 600; color: #4caf50;">${plu}</td>
+                    <td style="padding: 6px; text-align: right;">
+                        <button class="edit-btn" data-name="${name}" style="background: #2b2b2b; color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.2); padding: 3px 8px; border-radius: 4px; cursor: pointer; margin-right: 4px; font-size: 11px;">Ändern</button>
+                        <button class="del-btn" data-name="${name}" style="background: #2b2b2b; color: #f87171; border: 1px solid rgba(248, 113, 113, 0.2); padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">Löschen</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            }
+            table.appendChild(tbody);
+            content.appendChild(table);
+        }
+
+        modal.appendChild(content);
+
+        content.addEventListener('click', (e) => {
+            const target = e.target;
+            const name = target.getAttribute('data-name');
+            if (!name) return;
+
+            if (target.classList.contains('del-btn')) {
+                if (confirm(`Artikel "${name}" wirklich aus dem Speicher löschen?`)) {
+                    delete gespeichertePlus[name];
+                    speichereDaten('mein_plu_speicher', gespeichertePlus);
+                    modal.remove();
+                    oeffneSpeicherModal();
+                }
+            } else if (target.classList.contains('edit-btn')) {
+                const neuePlu = prompt(`Neue PLU für "${name}" eingeben:`, gespeichertePlus[name]);
+                if (neuePlu !== null && neuePlu.trim() !== '') {
+                    gespeichertePlus[name] = neuePlu.trim();
+                    speichereDaten('mein_plu_speicher', gespeichertePlus);
+                    modal.remove();
+                    oeffneSpeicherModal();
+                }
+            }
+        });
+
+        document.body.appendChild(modal);
+    }
+
+    function fuehrePluFillAus(isAuto = false) {
+        try {
+            const gelernteNamenPfade = hohleDaten('mein_name_pfad_index') || [];
+            const gelerntePluPfade = hohleDaten('mein_plu_pfad_index') || [];
+            const gespeichertePlus = hohleDaten('mein_plu_speicher') || {};
+            const alleKnoten = sammleAlleTextKnoten();
+
+            let gefundenerName = null;
+
+            for (let pfad of gelernteNamenPfade) {
+                for (let k of alleKnoten) {
+                    if (k.text.toLowerCase() === pfad.sampleText?.toLowerCase() ||
+                        (k.type === pfad.type && k.el.className && k.el.className === pfad.className)) {
+                        gefundenerName = k.text;
+                        break;
+                    }
+                }
+                if (gefundenerName) break;
+            }
+
+            if (!gefundenerName) {
+                for (let k of alleKnoten) {
+                    const txtClean = k.text.toLowerCase().trim();
+                    if (gespeichertePlus[txtClean]) {
+                        gefundenerName = k.text;
+                        break;
+                    }
+                }
+            }
+
+            if (!gefundenerName) {
+                if (isAuto) return false;
+                const manuellerName = prompt('[Lernen] Produktname nicht erkannt. Wie heißt das Produkt?');
+                if (!manuellerName) return false;
+                gefundenerName = manuellerName.trim();
+
+                let treffer = alleKnoten.find(k => k.text.toLowerCase().includes(gefundenerName.toLowerCase()));
+                if (treffer) {
+                    gelernteNamenPfade.push({
+                        className: treffer.el.className || '',
+                        type: treffer.type,
+                        sampleText: treffer.text
+                    });
+                    speichereDaten('mein_name_pfad_index', gelernteNamenPfade);
+                }
+            }
+
+            const nameClean = gefundenerName.toLowerCase().trim();
+            let zielPlu = null;
+
+            if (gespeichertePlus[nameClean]) {
+                zielPlu = gespeichertePlus[nameClean];
+                zeigeStatus(`Erkannt: ${gefundenerName} -> ${zielPlu}`);
+            }
+            else {
+                for (let pfad of gelerntePluPfade) {
+                    for (let k of alleKnoten) {
+                        if (k.type === pfad.type && k.el.className === pfad.className) {
+                            const m = k.text.match(/\b\d{2,3}\b/);
+                            if (m) {
+                                zielPlu = m[0];
+                                break;
+                            }
+                        }
+                    }
+                    if (zielPlu) break;
+                }
+            }
+
+            if (!zielPlu) {
+                if (isAuto) return false;
+                const neuePlu = prompt(`Produkt "${gefundenerName}" erkannt.\nBitte PLU-Nummer eingeben:`);
+                if (!neuePlu) return false;
+                zielPlu = neuePlu.trim();
+            }
+
+            gespeichertePlus[nameClean] = zielPlu;
+            speichereDaten('mein_plu_speicher', gespeichertePlus);
+
+            let pluTreffer = alleKnoten.find(k => {
+                const m = k.text.match(/\b\d{2,3}\b/);
+                return m && m[0] === zielPlu;
+            });
+
+            if (pluTreffer) {
+                const hatBereitsPfad = gelerntePluPfade.some(p => p.className === pluTreffer.el.className);
+                if (!hatBereitsPfad) {
+                    gelerntePluPfade.push({
+                        className: pluTreffer.el.className || '',
+                        type: pluTreffer.type
+                    });
+                    speichereDaten('mein_plu_pfad_index', gelerntePluPfade);
+                }
+            }
+
+            trageEinUndSende(zielPlu);
+            return true;
+
+        } catch (err) {
+            console.error('Fehler:', err);
+            return false;
+        }
+    }
+
+    function fuehreTestFillAus(isAuto = false) {
+        try {
+            const gespeichertePlus = hohleDaten('mein_plu_speicher') || {};
+            const alleKnoten = sammleAlleTextKnoten();
+
+            let gefundenerName = null;
+
+            for (let k of alleKnoten) {
+                const txtClean = k.text.toLowerCase().trim();
+                if (gespeichertePlus[txtClean]) {
+                    gefundenerName = k.text;
+                    break;
+                }
+            }
+
+            if (!gefundenerName) {
+                if (isAuto) return false;
+
+                // Fallback: Wenn kein bekannter Artikel gefunden wird, fragen wir nach dem Namen und der PLU
+                const manuellerName = prompt('[Test-Modus] Artikel nicht im Speicher. Welcher Artikel ist das?');
+                if (!manuellerName) return false;
+                gefundenerName = manuellerName.trim();
+            }
+
+            const nameClean = gefundenerName.toLowerCase().trim();
+            let zielPlu = null;
+
+            if (gespeichertePlus[nameClean]) {
+                zielPlu = gespeichertePlus[nameClean];
+                zeigeStatus(`[Test] Treffer: ${gefundenerName} -> ${zielPlu}`);
+            } else {
+                if (isAuto) return false;
+
+                // Hier wird jetzt sauber nach der PLU gefragt UND direkt abgespeichert!
+                const neuePlu = prompt(`[Test-Modus] Keine PLU für "${gefundenerName}" gefunden.\nBitte PLU-Nummer eingeben (wird gespeichert):`);
+                if (!neuePlu) return false;
+                zielPlu = neuePlu.trim();
+
+                gespeichertePlus[nameClean] = zielPlu;
+                speichereDaten('mein_plu_speicher', gespeichertePlus);
+                zeigeStatus(`Neu gespeichert: ${gefundenerName} -> ${zielPlu}`);
+            }
+
+            trageEinUndSende(zielPlu);
+            return true;
+        } catch (err) {
+            console.error('Test-Fehler:', err);
+            return false;
+        }
+    }
+
+    function trageEinUndSende(plu) {
+        function findeInput(root = document.body) {
+            let el = root.querySelector('input');
+            if (el) return el;
+            for (let child of root.querySelectorAll('*')) {
+                if (child.shadowRoot) {
+                    let res = findeInput(child.shadowRoot);
+                    if (res) return res;
+                }
+            }
+            return null;
+        }
+
+        const inputFeld = findeInput();
+
+        if (inputFeld) {
+            inputFeld.focus();
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            nativeSetter.call(inputFeld, plu);
+            inputFeld.dispatchEvent(new Event('input', { bubbles: true }));
+            inputFeld.dispatchEvent(new Event('change', { bubbles: true }));
+
+            setTimeout(() => {
+                ['keydown', 'keypress', 'keyup'].forEach(type => {
+                    inputFeld.dispatchEvent(new KeyboardEvent(type, {
+                        key: 'Enter', keyCode: 13, code: 'Enter', bubbles: true, cancelable: true
+                    }));
+                });
+            }, 60);
+        }
+    }
+
+    function erstelleButtons() {
+        if (document.getElementById('plu-menu-container')) return;
+
+        const container = document.createElement('div');
+        container.id = 'plu-menu-container';
+        container.style.position = 'fixed';
+        container.style.bottom = '15px';
+        container.style.right = '15px';
+        container.style.zIndex = '9999999';
+        container.style.display = 'flex';
+        container.style.flexDirection = 'column';
+        container.style.alignItems = 'flex-end';
+        container.style.fontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+        function erstelleMenueButton(text, callback) {
+            const btn = document.createElement('button');
+            btn.innerText = text;
+            btn.style.padding = '7px 10px';
+            btn.style.backgroundColor = '#252525';
+            btn.style.color = '#dcdcdc';
+            btn.style.border = '1px solid rgba(255,255,255,0.06)';
+            btn.style.borderRadius = '5px';
+            btn.style.fontSize = '11px';
+            btn.style.fontWeight = '500';
+            btn.style.cursor = 'pointer';
+            btn.style.textAlign = 'left';
+            btn.style.whiteSpace = 'nowrap';
+            btn.style.transition = 'background 0.15s ease';
+
+            btn.addEventListener('mouseenter', () => btn.style.backgroundColor = '#303030');
+            btn.addEventListener('mouseleave', () => btn.style.backgroundColor = '#252525');
+            btn.addEventListener('click', callback);
+            return btn;
+        }
+
+        const gearSubmenu = document.createElement('div');
+        gearSubmenu.style.display = 'none';
+        gearSubmenu.style.flexDirection = 'column';
+        gearSubmenu.style.gap = '5px';
+        gearSubmenu.style.marginBottom = '6px';
+        gearSubmenu.style.background = 'rgba(20, 20, 20, 0.95)';
+        gearSubmenu.style.backdropFilter = 'blur(8px)';
+        gearSubmenu.style.padding = '8px';
+        gearSubmenu.style.borderRadius = '8px';
+        gearSubmenu.style.border = '1px solid rgba(255,255,255,0.08)';
+        gearSubmenu.style.boxShadow = '0px 6px 16px rgba(0,0,0,0.4)';
+        gearSubmenu.style.minWidth = '200px';
+
+        function erstelleUntermenueBox(titelText) {
+            const wrapper = document.createElement('div');
+            wrapper.style.display = 'flex';
+            wrapper.style.flexDirection = 'column';
+            wrapper.style.gap = '3px';
+
+            const toggleBtn = document.createElement('button');
+            toggleBtn.innerText = titelText + ' ▾';
+            toggleBtn.style.padding = '7px 10px';
+            toggleBtn.style.backgroundColor = '#252525';
+            toggleBtn.style.color = '#e0e0e0';
+            toggleBtn.style.border = '1px solid rgba(255,255,255,0.06)';
+            toggleBtn.style.borderRadius = '5px';
+            toggleBtn.style.fontSize = '11px';
+            toggleBtn.style.fontWeight = '500';
+            toggleBtn.style.cursor = 'pointer';
+            toggleBtn.style.textAlign = 'left';
+
+            const subContent = document.createElement('div');
+            subContent.style.display = 'none';
+            subContent.style.flexDirection = 'column';
+            subContent.style.gap = '3px';
+            subContent.style.paddingLeft = '8px';
+            subContent.style.marginTop = '2px';
+            subContent.style.borderLeft = '1px solid rgba(255,255,255,0.15)';
+
+            toggleBtn.addEventListener('click', () => {
+                const isOpen = subContent.style.display === 'flex';
+                subContent.style.display = isOpen ? 'none' : 'flex';
+                toggleBtn.innerText = titelText + (isOpen ? ' ▾' : ' ▴');
+            });
+
+            wrapper.appendChild(toggleBtn);
+            wrapper.appendChild(subContent);
+            return { wrapper, subContent };
+        }
+
+        const functionsGroup = erstelleUntermenueBox('⚙️ Funktionen & Auto-Play');
+
+        const lernenBtn = erstelleMenueButton('🎓 PLU ausfüllen & lernen', () => fuehrePluFillAus(false));
+
+        const gearPlayLernenBtn = erstelleMenueButton('▶️ Auto-Play Lernen', () => {
+            if (autoTestInterval) {
+                alert("Bitte erst Auto-Play Test stoppen!");
+                return;
+            }
+            if (autoRunInterval) {
+                clearInterval(autoRunInterval);
+                autoRunInterval = null;
+                gearPlayLernenBtn.innerText = '▶️ Auto-Play Lernen';
+                zeigeStatus('Auto-Play Lernen gestoppt.');
+            } else {
+                gearPlayLernenBtn.innerText = '⏸️ Lernen Stoppen';
+                zeigeStatus('Auto-Play Lernen läuft...');
+
+                autoRunInterval = setInterval(() => {
+                    let erfolg = fuehrePluFillAus(true);
+                    if (!erfolg) {
+                        clearInterval(autoRunInterval);
+                        autoRunInterval = null;
+                        gearPlayLernenBtn.innerText = '▶️ Auto-Play Lernen';
+                        zeigeStatus('Auto-Play beendet (kein Artikel mehr gefunden).');
+                    }
+                }, 500);
+            }
+        });
+
+        const gearPlayTestBtn = erstelleMenueButton('▶️ Auto-Play Test', () => {
+            if (autoRunInterval) {
+                alert("Bitte erst Auto-Play Lernen stoppen!");
+                return;
+            }
+            if (autoTestInterval) {
+                clearInterval(autoTestInterval);
+                autoTestInterval = null;
+                gearPlayTestBtn.innerText = '▶️ Auto-Play Test';
+                zeigeStatus('Auto-Play Test gestoppt.');
+            } else {
+                gearPlayTestBtn.innerText = '⏸️ Test Stoppen';
+                zeigeStatus('Auto-Play Test läuft...');
+
+                autoTestInterval = setInterval(() => {
+                    let erfolg = fuehreTestFillAus(true);
+                    if (!erfolg) {
+                        clearInterval(autoTestInterval);
+                        autoTestInterval = null;
+                        gearPlayTestBtn.innerText = '▶️ Auto-Play Test';
+                        zeigeStatus('Auto-Play Test beendet (Test vorbei).');
+                    }
+                }, 500);
+            }
+        });
+
+        functionsGroup.subContent.appendChild(lernenBtn);
+        functionsGroup.subContent.appendChild(gearPlayLernenBtn);
+        functionsGroup.subContent.appendChild(gearPlayTestBtn);
+        gearSubmenu.appendChild(functionsGroup.wrapper);
+
+        gearSubmenu.appendChild(erstelleMenueButton('📦 Speicher anzeigen', oeffneSpeicherModal));
+
+        const resetGroup = erstelleUntermenueBox('🧹 Zurücksetzen');
+
+        const delItemBtn = erstelleMenueButton('🗑️ Aktiven Artikel löschen', () => {
+            const gelernteNamenPfade = hohleDaten('mein_name_pfad_index') || [];
+            const gespeichertePlus = hohleDaten('mein_plu_speicher') || {};
+            const alleKnoten = sammleAlleTextKnoten();
+            let gefundenerName = null;
+
+            for (let pfad of gelernteNamenPfade) {
+                for (let k of alleKnoten) {
+                    if (k.text.toLowerCase() === pfad.sampleText?.toLowerCase() ||
+                        (k.type === pfad.type && k.el.className && k.el.className === pfad.className)) {
+                        gefundenerName = k.text;
+                        break;
+                    }
+                }
+                if (gefundenerName) break;
+            }
+
+            if (!gefundenerName) {
+                alert("Kein aktiver Artikel erkannt.");
+                return;
+            }
+
+            const nameClean = gefundenerName.toLowerCase().trim();
+            if (gespeichertePlus[nameClean]) {
+                if (confirm(`Eintrag für "${gefundenerName}" löschen?`)) {
+                    delete gespeichertePlus[nameClean];
+                    speichereDaten('mein_plu_speicher', gespeichertePlus);
+                    alert(`Gelöscht!`);
+                }
+            } else {
+                alert(`Keine PLU für "${gefundenerName}" im Speicher.`);
+            }
+        });
+
+        const resetListBtn = erstelleMenueButton('🔄 Nur PLU-Liste zurücksetzen', () => {
+            if (confirm("Nur die gespeicherte PLU-Liste zurücksetzen?")) {
+                localStorage.removeItem('mein_plu_speicher');
+                alert("PLU-Liste zurückgesetzt.");
+            }
+        });
+
+        const resetPathsBtn = erstelleMenueButton('🗺️ Nur Pfade zurücksetzen', () => {
+            if (confirm("Nur die gelernten Layout-Pfade zurücksetzen?")) {
+                localStorage.removeItem('mein_name_pfad_index');
+                localStorage.removeItem('mein_plu_pfad_index');
+                alert("Pfade zurückgesetzt.");
+            }
+        });
+
+        const resetAllBtn = erstelleMenueButton('🧹 Alles zurücksetzen', () => {
+            if (confirm("Kompletten Skript-Speicher wirklich zurücksetzen?")) {
+                if (autoRunInterval) clearInterval(autoRunInterval);
+                if (autoTestInterval) clearInterval(autoTestInterval);
+                localStorage.clear();
+                alert("Alles zurückgesetzt! Die Seite wird neu geladen.");
+                location.reload();
+            }
+        });
+
+        resetGroup.subContent.appendChild(delItemBtn);
+        resetGroup.subContent.appendChild(resetListBtn);
+        resetGroup.subContent.appendChild(resetPathsBtn);
+        resetGroup.subContent.appendChild(resetAllBtn);
+        gearSubmenu.appendChild(resetGroup.wrapper);
+
+        container.appendChild(gearSubmenu);
+
+        const bottomRow = document.createElement('div');
+        bottomRow.style.display = 'flex';
+        bottomRow.style.alignItems = 'center';
+        bottomRow.style.gap = '6px';
+
+        const testFillBtn = document.createElement('button');
+        testFillBtn.id = 'plu-test-fill-btn';
+        testFillBtn.innerText = '⚡ Test ausfüllen';
+        testFillBtn.style.padding = '9px 14px';
+        testFillBtn.style.backgroundColor = '#1e1e1e';
+        testFillBtn.style.color = '#e0e0e0';
+        testFillBtn.style.border = '1px solid rgba(255,255,255,0.1)';
+        testFillBtn.style.borderRadius = '20px';
+        testFillBtn.style.fontSize = '12px';
+        testFillBtn.style.fontWeight = '500';
+        testFillBtn.style.boxShadow = '0px 3px 10px rgba(0,0,0,0.3)';
+        testFillBtn.style.cursor = 'pointer';
+        testFillBtn.style.transition = 'all 0.15s ease';
+
+        testFillBtn.addEventListener('mouseenter', () => {
+            testFillBtn.style.backgroundColor = '#2a2a2a';
+            testFillBtn.style.borderColor = 'rgba(255,255,255,0.2)';
+        });
+        testFillBtn.addEventListener('mouseleave', () => {
+            testFillBtn.style.backgroundColor = '#1e1e1e';
+            testFillBtn.style.borderColor = 'rgba(255,255,255,0.1)';
+        });
+        testFillBtn.addEventListener('click', () => fuehreTestFillAus(false));
+        bottomRow.appendChild(testFillBtn);
+
+        const gearBtn = document.createElement('button');
+        gearBtn.innerText = '⚙️';
+        gearBtn.title = 'Menü öffnen';
+        gearBtn.style.padding = '8px 10px';
+        gearBtn.style.backgroundColor = '#1e1e1e';
+        gearBtn.style.color = '#e0e0e0';
+        gearBtn.style.border = '1px solid rgba(255,255,255,0.1)';
+        gearBtn.style.borderRadius = '50%';
+        gearBtn.style.fontSize = '13px';
+        gearBtn.style.boxShadow = '0px 3px 10px rgba(0,0,0,0.3)';
+        gearBtn.style.cursor = 'pointer';
+        gearBtn.style.transition = 'all 0.15s ease';
+
+        gearBtn.addEventListener('mouseenter', () => {
+            gearBtn.style.backgroundColor = '#2a2a2a';
+            gearBtn.style.borderColor = 'rgba(255,255,255,0.2)';
+        });
+        gearBtn.addEventListener('mouseleave', () => {
+            gearBtn.style.backgroundColor = '#1e1e1e';
+            gearBtn.style.borderColor = 'rgba(255,255,255,0.1)';
+        });
+        gearBtn.addEventListener('click', () => {
+            gearSubmenu.style.display = gearSubmenu.style.display === 'flex' ? 'none' : 'flex';
+        });
+        bottomRow.appendChild(gearBtn);
+
+        container.appendChild(bottomRow);
+        document.body.appendChild(container);
+    }
+
+    setTimeout(erstelleButtons, 1000);
+})();
